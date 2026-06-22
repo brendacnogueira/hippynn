@@ -12,7 +12,7 @@ from torch.nn.parameter import Parameter
 
 from torch.nn import Module
 from torch.nn.modules.linear import NonDynamicallyQuantizableLinear
-
+import torch.nn as nn
 
 __all__ = [
     "Threshold",
@@ -1175,11 +1175,13 @@ class MultiheadAttention(Module):
         batch_first=False,
         device=None,
         dtype=None,
-        use_euclidean_rope=False,
+        use_euclidean_rope=True,
+        use_distance_bias=False,
+        use_distance_mlp_bias=False,
         rope_num_frequencies=16,
         rope_min_frequency=0.1,
         rope_max_frequency=10.0,
-        rope_eps=1e-8,
+        rope_eps=1e-6,
     ) -> None:
         if embed_dim <= 0 or num_heads <= 0:
             raise ValueError(
@@ -1197,10 +1199,14 @@ class MultiheadAttention(Module):
         self.dropout = dropout
         self.batch_first = batch_first
         self.use_euclidean_rope = use_euclidean_rope
+        self.use_distance_bias = use_distance_bias
+        self.use_distance_mlp_bias = use_distance_mlp_bias
         self.rope_eps = rope_eps
         self.head_dim = embed_dim // num_heads
         if self.head_dim * num_heads != self.embed_dim:
             raise AssertionError("embed_dim must be divisible by num_heads")
+        if sum(bool(value) for value in (self.use_euclidean_rope, self.use_distance_bias, self.use_distance_mlp_bias)) > 1:
+            raise ValueError("Only one distance attention bias can be enabled")
 
         if use_euclidean_rope:
             if rope_num_frequencies <= 0:
@@ -1216,10 +1222,23 @@ class MultiheadAttention(Module):
                 **factory_kwargs,
             )
             self.register_buffer("rope_frequencies", frequencies)
-            self.rope_weights = Parameter(torch.zeros(num_heads, int(rope_num_frequencies), **factory_kwargs))
+            self.rope_weights = Parameter(
+                torch.ones(num_heads, int(rope_num_frequencies), **factory_kwargs) / int(rope_num_frequencies)
+            )
         else:
             self.register_buffer("rope_frequencies", None)
             self.register_parameter("rope_weights", None)
+
+        if use_distance_mlp_bias:
+            distance_bias_hidden = max(num_heads, 8)
+            self.distance_bias_mlp = nn.Sequential(
+                nn.Linear(1, distance_bias_hidden, **factory_kwargs),
+                nn.SiLU(),
+                nn.Linear(distance_bias_hidden, num_heads, **factory_kwargs),
+                nn.SiLU(),
+            )
+        else:
+            self.distance_bias_mlp = None
 
         if not self._qkv_same_embed_dim:
             self.q_proj_weight = Parameter(
@@ -1381,32 +1400,75 @@ class MultiheadAttention(Module):
             check_other=False,
         )
 
-        if self.use_euclidean_rope:
+        if self.use_euclidean_rope or self.use_distance_bias or self.use_distance_mlp_bias:
             if euclidean_rope_distances is None:
-                raise ValueError("euclidean_rope_distances is required when use_euclidean_rope=True")
-            rope_attn_mask = self._euclidean_rope_attn_mask(
-                euclidean_rope_distances,
-                query=query,
-                key=key,
-                is_batched=is_batched,
-                mask=euclidean_rope_mask,
-            )
-            if attn_mask is None:
-                attn_mask = rope_attn_mask
-            elif attn_mask.dim() == 2:
-                attn_mask = attn_mask.unsqueeze(0) + rope_attn_mask
+                raise ValueError(
+                    "euclidean_rope_distances is required when use_euclidean_rope=True "
+                    "or use_distance_bias=True or use_distance_mlp_bias=True"
+                )
+            if self.use_euclidean_rope:
+                distance_attn_mask = self._euclidean_rope_attn_mask(
+                    euclidean_rope_distances,
+                    query=query,
+                    key=key,
+                    is_batched=is_batched,
+                    mask=euclidean_rope_mask,
+                )
+            elif self.use_distance_bias:
+                distance_attn_mask = self._distance_bias_attn_mask(
+                    euclidean_rope_distances,
+                    query=query,
+                    key=key,
+                    is_batched=is_batched,
+                    mask=euclidean_rope_mask,
+                )
             else:
-                attn_mask = attn_mask + rope_attn_mask
-        print(rope_attn_mask.shape)
-        print(rope_attn_mask)
+                distance_attn_mask = self._distance_mlp_bias_attn_mask(
+                    euclidean_rope_distances,
+                    query=query,
+                    key=key,
+                    is_batched=is_batched,
+                    mask=euclidean_rope_mask,
+                )
 
+            if attn_mask is None:
+                attn_mask = distance_attn_mask
+            elif attn_mask.dim() == 2:
+                attn_mask = attn_mask.unsqueeze(0) + distance_attn_mask
+            else:
+                attn_mask = attn_mask + distance_attn_mask
+            ################## Print
+            if False:
+                batch_size = query.shape[0] if self.batch_first else query.shape[1]
+                n_nodes = attn_mask.shape[-1]
 
+                mask_by_molecule = attn_mask.detach().cpu().view(
+                    batch_size,
+                    self.num_heads,
+                    n_nodes,
+                    n_nodes,
+                )
+
+                print("attn_mask:", attn_mask.shape)
+
+                for head_idx in range(self.num_heads):
+                    print(f"\nhead {head_idx}")
+
+                    left = mask_by_molecule[0, head_idx]
+                    right = mask_by_molecule[1, head_idx]
+
+                    for row_left, row_right in zip(left, right):
+                        left_str = " ".join(f"{x:8.3f}" for x in row_left)
+                        right_str = " ".join(f"{x:8.3f}" for x in row_right)
+                        print(f"{left_str}    |    {right_str}")
+            ###################
+        
         is_fastpath_enabled = torch.backends.mha.get_fastpath_enabled()
-
+    
         if not is_fastpath_enabled:
             why_not_fast_path = "torch.backends.mha.get_fastpath_enabled() was not True"
-        elif self.use_euclidean_rope:
-            why_not_fast_path = "euclidean rope attention bias was used"
+        elif self.use_euclidean_rope or self.use_distance_bias or self.use_distance_mlp_bias:
+            why_not_fast_path = "distance attention bias was used"
         elif not is_batched:
             why_not_fast_path = (
                 f"input not batched; expected query.dim() of 3 but got {query.dim()}"
@@ -1516,6 +1578,7 @@ class MultiheadAttention(Module):
                     value = key
             else:
                 query, key, value = (x.transpose(1, 0) for x in (query, key, value))
+      
 
         if not self._qkv_same_embed_dim:
             attn_output, attn_output_weights = F.multi_head_attention_forward(
@@ -1541,6 +1604,7 @@ class MultiheadAttention(Module):
                 k_proj_weight=self.k_proj_weight,
                 v_proj_weight=self.v_proj_weight,
                 average_attn_weights=average_attn_weights,
+                
                 is_causal=is_causal,
             )
         else:
@@ -1564,7 +1628,9 @@ class MultiheadAttention(Module):
                 attn_mask=attn_mask,
                 average_attn_weights=average_attn_weights,
                 is_causal=is_causal,
+                
             )
+    
         if self.batch_first and is_batched:
             attn_output = attn_output.transpose(1, 0)
             if fast_path_blocked_by_tracing:
@@ -1590,6 +1656,145 @@ class MultiheadAttention(Module):
             src_len = key.shape[0]
         else:
             batch_size, tgt_len, src_len = 1, query.shape[0], key.shape[0]
+        
+     
+        if distances.dim() == 2:
+            distances = distances.unsqueeze(0)
+        if distances.shape != (batch_size, tgt_len, src_len):
+            raise RuntimeError(
+                "euclidean_rope_distances must have shape "
+                f"{(batch_size, tgt_len, src_len)}, got {tuple(distances.shape)}"
+            )
+        
+        frequencies = self.rope_frequencies.to(dtype=query.dtype, device=query.device)
+        weights = torch.softmax(self.rope_weights, dim=-1).to(dtype=query.dtype, device=query.device)        
+        
+        phase = distances.to(dtype=query.dtype, device=query.device).unsqueeze(-1) * frequencies
+        
+        sinc = torch.where(
+            phase.abs() < self.rope_eps,
+            torch.ones_like(phase),
+            torch.sin(phase) / phase,
+        )
+        
+        freq_weight = torch.einsum("blsm,hm->bhls", sinc, weights)
+        
+
+        # Debug: print distances, sinc features, and learned weights.
+        if False:
+            debug_num_molecules = min(batch_size, 2)
+            debug_num_heads = min(self.num_heads, 2)
+            debug_num_freqs = min(frequencies.numel(), 6)
+
+            d_cpu = distances.detach().cpu()
+            phase_cpu=phase.detach().cpu()
+            sinc_cpu = sinc.detach().cpu()
+            weights_cpu = weights.detach().cpu()
+            freq_weight_cpu = freq_weight.detach().cpu()
+            freqs_cpu = frequencies.detach().cpu()
+
+            def format_matrix(mat):
+                return [" ".join(f"{x:8.3f}" for x in row) for row in mat]
+
+            def print_side_by_side(title, mats):
+                print(f"\n{title}")
+                formatted = [format_matrix(m) for m in mats]
+                for rows in zip(*formatted):
+                    print("    |    ".join(rows))
+
+            print("\n" + "=" * 100)
+            print("Euclidean RoPE debug")
+            print(f"distances shape:   {tuple(d_cpu.shape)}")
+            print(f"sinc shape:        {tuple(sinc_cpu.shape)}")
+            print(f"weights shape:     {tuple(weights_cpu.shape)}")
+            print(f"freq_weight shape: {tuple(freq_weight_cpu.shape)}")
+
+            # Distance matrix for molecule 0 and molecule 1 side by side.
+            print_side_by_side(
+                "distance matrix: molecule 0 | molecule 1",
+                [d_cpu[mol] for mol in range(debug_num_molecules)],
+            )
+
+            # Print several individual sinc frequency matrices.
+            for freq_idx in range(debug_num_freqs):
+                freq_value = freqs_cpu[freq_idx].item()
+                print_side_by_side(
+                    f"distance * frequency {freq_idx}={freq_value:.4f}: molecule 0 | molecule 1",
+                    [phase_cpu[mol, :, :, freq_idx] for mol in range(debug_num_molecules)],
+                )
+                print_side_by_side(
+                    f"sinc(distance * frequency {freq_idx}={freq_value:.4f}): molecule 0 | molecule 1",
+                    [sinc_cpu[mol, :, :, freq_idx] for mol in range(debug_num_molecules)],
+                )
+
+            # Learned weights are shared across molecules, but different per head.
+            print("\nlearned rope weights for first heads/frequencies")
+            header = "          " + " ".join(f"f{idx:02d}" for idx in range(debug_num_freqs))
+            print(header)
+            for head_idx in range(debug_num_heads):
+                row = " ".join(f"{weights_cpu[head_idx, freq_idx].item():8.3f}" for freq_idx in range(debug_num_freqs))
+                print(f"head {head_idx}: {row}")
+
+            # Combined result after summing sinc frequencies with per-head weights.
+            for head_idx in range(debug_num_heads):
+                print_side_by_side(
+                    f"freq_weight after sinc @ weights, head {head_idx}: molecule 0 | molecule 1",
+                    [freq_weight_cpu[mol, head_idx] for mol in range(debug_num_molecules)],
+                )
+
+            print("=" * 100)
+
+
+
+
+
+        valid_mask = None
+        if mask is not None:
+            if mask.dim() == 2:
+                mask = mask.unsqueeze(0)
+            if mask.shape != distances.shape:
+                raise RuntimeError(
+                            "euclidean_rope_mask must have the same shape as euclidean_rope_distances, "
+                            f"got {tuple(mask.shape)} and {tuple(distances.shape)}"
+                        )
+            valid_mask = mask.to(dtype=torch.bool, device=query.device)
+            freq_weight = freq_weight.masked_fill(~valid_mask.unsqueeze(1), 0.0)
+
+        #freq_weight = F.softplus(freq_weight) + self.rope_eps
+        if valid_mask is None:
+            valid_count = freq_weight.new_full((batch_size, 1, 1, 1), tgt_len * src_len)
+        else:
+            valid_count = valid_mask.sum(dim=(1, 2), keepdim=True).unsqueeze(1).to(dtype=freq_weight.dtype)
+       # denom = freq_weight.sum(dim=(2, 3), keepdim=True).clamp_min(self.rope_eps)
+        #freq_weight = freq_weight * (valid_count.clamp_min(1.0) / denom)
+
+        #bias = freq_weight.log()
+        
+        
+        bias = freq_weight
+      
+        
+        if valid_mask is not None:
+            bias = bias.masked_fill(~valid_mask.unsqueeze(1), 0.0)
+        
+        return bias.reshape(batch_size * self.num_heads, tgt_len, src_len)
+
+    def _distance_bias_attn_mask(
+        self,
+        distances: Tensor,
+        query: Tensor,
+        key: Tensor,
+        is_batched: bool,
+        mask: Tensor | None = None,
+    ) -> Tensor:
+        if self.batch_first and is_batched:
+            batch_size, tgt_len = query.shape[0], query.shape[1]
+            src_len = key.shape[1]
+        elif is_batched:
+            tgt_len, batch_size = query.shape[0], query.shape[1]
+            src_len = key.shape[0]
+        else:
+            batch_size, tgt_len, src_len = 1, query.shape[0], key.shape[0]
 
         if distances.dim() == 2:
             distances = distances.unsqueeze(0)
@@ -1598,16 +1803,10 @@ class MultiheadAttention(Module):
                 "euclidean_rope_distances must have shape "
                 f"{(batch_size, tgt_len, src_len)}, got {tuple(distances.shape)}"
             )
+        
+        bias = distances.to(dtype=query.dtype, device=query.device).unsqueeze(1)
+        bias =  bias.expand(batch_size, self.num_heads, tgt_len, src_len)
 
-        frequencies = self.rope_frequencies.to(dtype=query.dtype, device=query.device)
-        weights = self.rope_weights.to(dtype=query.dtype, device=query.device)
-        phase = distances.to(dtype=query.dtype, device=query.device).unsqueeze(-1) * frequencies
-        sinc = torch.where(
-            phase.abs() < self.rope_eps,
-            torch.ones_like(phase),
-            torch.sin(phase) / phase,
-        )
-        bias = torch.einsum("blsm,hm->bhls", sinc, weights)
         if mask is not None:
             if mask.dim() == 2:
                 mask = mask.unsqueeze(0)
@@ -1616,7 +1815,53 @@ class MultiheadAttention(Module):
                     "euclidean_rope_mask must have the same shape as euclidean_rope_distances, "
                     f"got {tuple(mask.shape)} and {tuple(distances.shape)}"
                 )
-            bias = bias.masked_fill(~mask.to(dtype=torch.bool, device=query.device).unsqueeze(1), 0.0)
+            valid_mask = mask.to(dtype=torch.bool, device=query.device)
+            bias = bias.masked_fill(~valid_mask.unsqueeze(1), 0.0)
+
+        return bias.reshape(batch_size * self.num_heads, tgt_len, src_len)
+
+    def _distance_mlp_bias_attn_mask(
+        self,
+        distances: Tensor,
+        query: Tensor,
+        key: Tensor,
+        is_batched: bool,
+        mask: Tensor | None = None,
+    ) -> Tensor:
+        if self.batch_first and is_batched:
+            batch_size, tgt_len = query.shape[0], query.shape[1]
+            src_len = key.shape[1]
+        elif is_batched:
+            tgt_len, batch_size = query.shape[0], query.shape[1]
+            src_len = key.shape[0]
+        else:
+            batch_size, tgt_len, src_len = 1, query.shape[0], key.shape[0]
+
+        if distances.dim() == 2:
+            distances = distances.unsqueeze(0)
+        if distances.shape != (batch_size, tgt_len, src_len):
+            raise RuntimeError(
+                "euclidean_rope_distances must have shape "
+                f"{(batch_size, tgt_len, src_len)}, got {tuple(distances.shape)}"
+            )
+        distances = distances.to(dtype=query.dtype, device=query.device)
+        valid_mask = None
+        if mask is not None:
+            if mask.dim() == 2:
+                mask = mask.unsqueeze(0)
+            if mask.shape != distances.shape:
+                raise RuntimeError(
+                    "euclidean_rope_mask must have the same shape as euclidean_rope_distances, "
+                    f"got {tuple(mask.shape)} and {tuple(distances.shape)}"
+                )
+            valid_mask = mask.to(dtype=torch.bool, device=query.device)
+
+        if valid_mask is None:
+            valid_mask = torch.ones_like(distances, dtype=torch.bool, device=query.device)
+       
+
+        bias = self.distance_bias_mlp(distances.unsqueeze(-1)).permute(0, 3, 1, 2)
+        bias = bias.masked_fill(~valid_mask.unsqueeze(1), 0.0)
         return bias.reshape(batch_size * self.num_heads, tgt_len, src_len)
 
     def merge_masks(
@@ -1631,7 +1876,7 @@ class MultiheadAttention(Module):
         and the corresponding mask type will be returned. If both masks are provided, they will be both
         expanded to shape ``(batch_size, num_heads, seq_len, seq_len)``, combined with logical ``or``
         and mask type 2 will be returned
-        Args:
+        Args:de
             attn_mask: attention mask of shape ``(seq_len, seq_len)``, mask type 0
             key_padding_mask: padding mask of shape ``(batch_size, seq_len)``, mask type 1
             query: query embeddings of shape ``(batch_size, seq_len, embed_dim)``

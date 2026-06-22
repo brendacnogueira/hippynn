@@ -71,6 +71,8 @@ class Encoder1DBlock(nn.Module):
         dropout_rate: float = 0.1,
         attention_dropout_rate: float = 0.1,
         use_euclidean_rope: bool = False,
+        use_distance_bias: bool = False,
+        use_distance_mlp_bias: bool = False,
         rope_num_frequencies: int = 16,
         rope_min_frequency: float = 0.1,
         rope_max_frequency: float = 10.0,
@@ -83,9 +85,12 @@ class Encoder1DBlock(nn.Module):
             dropout=attention_dropout_rate,
             batch_first=True,
             use_euclidean_rope=use_euclidean_rope,
+            use_distance_bias=use_distance_bias,
+            use_distance_mlp_bias=use_distance_mlp_bias,
             rope_num_frequencies=rope_num_frequencies,
             rope_min_frequency=rope_min_frequency,
             rope_max_frequency=rope_max_frequency,
+           
         )
         self.dropout = nn.Dropout(dropout_rate)
         self.norm2 = nn.LayerNorm(hidden_size)
@@ -101,16 +106,18 @@ class Encoder1DBlock(nn.Module):
         if inputs.ndim != 3:
             raise ValueError(f"Expected inputs with shape (batch, seq, hidden), got {tuple(inputs.shape)}")
         x_norm = self.norm1(inputs)
-        attn_output, _ = self.attention(
+        attn_output, att_weights= self.attention(
             x_norm,
             x_norm,
             x_norm,
             key_padding_mask=key_padding_mask,
-            need_weights=False,
+            need_weights=True,
             euclidean_rope_distances=pairwise_distances,
             euclidean_rope_mask=pairwise_distance_mask,
         )
+        
         x = inputs + self.dropout(attn_output)
+       
         return x + self.mlp(self.norm2(x))
 
 
@@ -127,7 +134,9 @@ class Encoder(nn.Module):
         attention_dropout_rate: float = 0.1,
         add_position_embedding: bool = False,
         max_len: int = 512,
-        use_euclidean_rope: bool = False,
+        use_euclidean_rope: bool = True,
+        use_distance_bias: bool = False,
+        use_distance_mlp_bias: bool = False,
         rope_num_frequencies: int = 16,
         rope_min_frequency: float = 0.1,
         rope_max_frequency: float = 10.0,
@@ -146,6 +155,8 @@ class Encoder(nn.Module):
                 dropout_rate=dropout_rate,
                 attention_dropout_rate=attention_dropout_rate,
                 use_euclidean_rope=use_euclidean_rope,
+                use_distance_bias=use_distance_bias,
+                use_distance_mlp_bias=use_distance_mlp_bias,
                 rope_num_frequencies=rope_num_frequencies,
                 rope_min_frequency=rope_min_frequency,
                 rope_max_frequency=rope_max_frequency,
@@ -271,6 +282,7 @@ class VisionTransformer(nn.Module):
             head_in = representation_size
 
         self.head = nn.Linear(head_in, num_classes) if num_classes else IdentityLayer()
+
         if isinstance(self.head, nn.Linear):
             nn.init.zeros_(self.head.weight)
             nn.init.constant_(self.head.bias, head_bias_init)
@@ -288,16 +300,16 @@ class VisionTransformer(nn.Module):
             hier_features = next((value for value in supplied if _looks_like_hier_features(value)), hier_features)
             system_index = next((value for value in supplied if _looks_like_system_index(value)), system_index)
             n_systems = next((value for value in supplied if _looks_like_n_systems(value)), n_systems)
-
+       
         if isinstance(hier_features, (list, tuple)):
             atom_features = hier_features[self.feature_index]
         else:
             atom_features = hier_features
-
         if system_index is None or n_systems is None:
             if atom_features.ndim != 3:
                 raise ValueError("Direct tensor input must have shape (batch, seq, features).")
             x = atom_features
+            
             valid_mask = torch.ones(x.shape[:2], dtype=torch.bool, device=x.device)
             token_positions = positions
         else:
@@ -309,7 +321,7 @@ class VisionTransformer(nn.Module):
                         raise ValueError("atom_index is required to align batched positions with flat atom features.")
                     positions = positions[system_index, atom_index]
                 token_positions, _ = _atom_features_to_tokens(positions, system_index, n_systems)
-
+        
         x = self.input_projection(x)
         key_padding_mask = ~valid_mask
         pairwise_distances = None
@@ -334,6 +346,7 @@ class VisionTransformer(nn.Module):
 
         x = self.encoder(
             x,
+
             key_padding_mask=key_padding_mask,
             pairwise_distances=pairwise_distances,
             pairwise_distance_mask=pairwise_distance_mask,
@@ -347,7 +360,50 @@ class VisionTransformer(nn.Module):
         elif self.classifier in {"unpooled", "token_unpooled"}:
             pass
 
-        return self.head(self.pre_logits(x))
+
+        
+        pre_logits = self.pre_logits(x)
+        logits = self.head(pre_logits)
+        probs = torch.softmax(logits, dim=-1)
+
+        
+        self._debug_output_count = 0
+
+        if (self._debug_output_count < 10) and (False):
+            with torch.no_grad():
+                print("\n[final transformer output debug]")
+                print(f"encoder output x shape: {tuple(x.shape)}")
+                print(f"pre_logits shape:       {tuple(pre_logits.shape)}")
+                print(f"logits shape:           {tuple(logits.shape)}")
+
+                for mol in range(min(x.shape[0], 2)):
+                    print(f"\nmolecule {mol}")
+                    print("encoder pooled/final x:")
+                    print(x[mol].detach().cpu())
+
+                    print("pre_logits:")
+                    print(pre_logits[mol].detach().cpu())
+
+                    print("logits:")
+                    print(logits[mol].detach().cpu())
+
+                    print("probabilities:")
+                    print(probs[mol].detach().cpu())
+
+                if x.shape[0] >= 2:
+                    print("\ndifferences molecule 0 - molecule 1")
+                    print("x abs max diff:", (x[0] - x[1]).detach().abs().max().cpu().item())
+                    print("x L2 diff:", torch.linalg.vector_norm((x[0] - x[1]).detach()).cpu().item())
+                    print("pre_logits abs max diff:", (pre_logits[0] - pre_logits[1]).detach().abs().max().cpu().item())
+                    print("pre_logits L2 diff:", torch.linalg.vector_norm((pre_logits[0] - pre_logits[1]).detach()).cpu().item())
+                    print("logits diff:", (logits[0] - logits[1]).detach().cpu())
+                
+                
+
+            self._debug_output_count += 1
+
+        return logits
+        #return self.head(self.pre_logits(x))
 
 
 def _looks_like_hier_features(value: Any) -> bool:
